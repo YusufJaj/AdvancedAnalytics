@@ -140,3 +140,37 @@ def placement():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/profitability', methods=['POST'])
+def profitability():
+    try:
+        data = request.json
+        forecasted_sales = float(data['ForecastedSales'])
+        unit_price = float(data['UnitPrice'])
+        reorder_qty = float(data.get('ReorderQuantity', 1)) or 1
+
+        # Forecasted Revenue
+        revenue = forecasted_sales * unit_price
+
+        # Scaled score from 1 to 10
+        if revenue > 10000:
+            score = 10
+        elif revenue > 5000:
+            score = 8
+        elif revenue > 1000:
+            score = 6
+        elif revenue > 500:
+            score = 4
+        else:
+            score = 2
+
+        # ROI = Revenue per reordered unit
+        roi = revenue / reorder_qty
+
+        return jsonify({
+            "ForecastedRevenue": round(revenue, 2),
+            "ProfitabilityScore": score,
+            "RestockROI": round(roi, 2)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
