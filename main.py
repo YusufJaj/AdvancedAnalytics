@@ -7,57 +7,77 @@ import pandas as pd
 import gspread
 import os
 import json
+import threading
+import time
+import logging
+from datetime import datetime, timedelta
 
-# Load Google Sheets credentials from Render environment variable
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Load credentials
 google_creds = json.loads(os.environ['GOOGLE_CREDS_JSON'])
 scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = Credentials.from_service_account_info(google_creds, scopes=scopes)
-
-# Authorize gspread
 gc = gspread.authorize(creds)
 
-# Connect to the Google Sheet
-spreadsheet = gc.open_by_url("https://docs.google.com/spreadsheets/d/1kyAE8sdc9Ekysc8H7mbrKtqffdlKDXjGsFr881Q1WIA")
-worksheet = spreadsheet.worksheet("Sheet1")
-data = worksheet.get_all_records()
-df = pd.DataFrame(data)
-
-# Feature engineering
-df['SalesVelocity'] = pd.to_numeric(df['SalesLast30Days'], errors='coerce').fillna(0) / 30
-df['ShrinkageRate'] = pd.to_numeric(df['ShrinkageLast30Days'], errors='coerce').fillna(0) / 30
-
-# Sales and shrinkage models
-X_sales = df[['SalesVelocity', 'StockLevel']]
-y_sales = pd.to_numeric(df['SalesLast30Days'], errors='coerce').fillna(0) * 1.2
-sales_model = LinearRegression().fit(X_sales, y_sales)
-
-X_shrink = df[['StockLevel', 'SalesLast30Days']]
-X_shrink = X_shrink.apply(pd.to_numeric, errors='coerce').fillna(0)
-y_shrink = pd.to_numeric(df['ShrinkageLast30Days'], errors='coerce').fillna(0)
-shrink_model = LinearRegression().fit(X_shrink, y_shrink)
-
-# Convert key columns to numeric
-df['ForecastedSales'] = pd.to_numeric(df['ForecastedSales'], errors='coerce').fillna(0)
-df['UnitPrice'] = pd.to_numeric(df['UnitPrice'], errors='coerce').fillna(0)
-
-# Shelf optimization model
-df['PlacementScore'] = df['ForecastedSales'] * df['UnitPrice']
-score_nonzero = df[df['PlacementScore'] > 0]
-df.loc[score_nonzero.index, 'PlacementPriority'] = pd.qcut(
-    score_nonzero['PlacementScore'],
-    q=3,
-    labels=["Low", "Medium", "High"]
-)
-
-label_encoder = LabelEncoder()
-df['CategoryEncoded'] = label_encoder.fit_transform(df['Category'].astype(str))
-X_place = df[['ForecastedSales', 'ShrinkageRate', 'UnitPrice', 'CategoryEncoded']].fillna(0)
-y_place = df['PlacementPriority'].astype(str)
-placement_model = RandomForestClassifier(n_estimators=100, random_state=42)
-placement_model.fit(X_place, y_place)
-
-# Flask app setup
 app = Flask(__name__)
+
+# Global models
+sales_model = None
+shrink_model = None
+placement_model = None
+label_encoder = None
+df = None
+
+def retrain_models():
+    global df, sales_model, shrink_model, placement_model, label_encoder
+
+    logging.info("Retraining models...")
+
+    worksheet = gc.open_by_url("https://docs.google.com/spreadsheets/d/1kyAE8sdc9Ekysc8H7mbrKtqffdlKDXjGsFr881Q1WIA").worksheet("Sheet1")
+    data = worksheet.get_all_records()
+    df = pd.DataFrame(data)
+
+    df['SalesVelocity'] = pd.to_numeric(df['SalesLast30Days'], errors='coerce').fillna(0) / 30
+    df['ShrinkageRate'] = pd.to_numeric(df['ShrinkageLast30Days'], errors='coerce').fillna(0) / 30
+
+    X_sales = df[['SalesVelocity', 'StockLevel']]
+    y_sales = pd.to_numeric(df['SalesLast30Days'], errors='coerce').fillna(0) * 1.2
+    sales_model = LinearRegression().fit(X_sales, y_sales)
+
+    X_shrink = df[['StockLevel', 'SalesLast30Days']].apply(pd.to_numeric, errors='coerce').fillna(0)
+    y_shrink = pd.to_numeric(df['ShrinkageLast30Days'], errors='coerce').fillna(0)
+    shrink_model = LinearRegression().fit(X_shrink, y_shrink)
+
+    df['ForecastedSales'] = pd.to_numeric(df['ForecastedSales'], errors='coerce').fillna(0)
+    df['UnitPrice'] = pd.to_numeric(df['UnitPrice'], errors='coerce').fillna(0)
+    df['PlacementScore'] = df['ForecastedSales'] * df['UnitPrice']
+    score_nonzero = df[df['PlacementScore'] > 0]
+    df.loc[score_nonzero.index, 'PlacementPriority'] = pd.qcut(score_nonzero['PlacementScore'], q=3, labels=["Low", "Medium", "High"])
+
+    label_encoder = LabelEncoder()
+    df['CategoryEncoded'] = label_encoder.fit_transform(df['Category'].astype(str))
+    X_place = df[['ForecastedSales', 'ShrinkageRate', 'UnitPrice', 'CategoryEncoded']].fillna(0)
+    y_place = df['PlacementPriority'].astype(str)
+    placement_model = RandomForestClassifier(n_estimators=100, random_state=42)
+    placement_model.fit(X_place, y_place)
+
+    logging.info("Retraining complete.")
+
+def schedule_daily_retrain():
+    def run_daily():
+        while True:
+            now = datetime.now()
+            next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            time.sleep((next_run - now).total_seconds())
+            retrain_models()
+
+    threading.Thread(target=run_daily, daemon=True).start()
+
+# Initial training + daily scheduler
+retrain_models()
+schedule_daily_retrain()
 
 @app.route('/')
 def home():
@@ -101,12 +121,7 @@ def shrinkage():
     shrinkage_last = data['ShrinkageLast30Days']
     category = data.get('Category', 'General')
     predicted = round((shrinkage_last / max(sales, 1)) * sales * 1.1, 2)
-    if predicted > 10:
-        risk = "High"
-    elif predicted > 4:
-        risk = "Medium"
-    else:
-        risk = "Low"
+    risk = "High" if predicted > 10 else "Medium" if predicted > 4 else "Low"
     flag = risk in ["High", "Medium"]
     return jsonify({
         "PredictedShrinkageNextMonth": predicted,
@@ -125,9 +140,8 @@ def placement():
         if category not in label_encoder.classes_:
             category = 'Staples'
         category_encoded = label_encoder.transform([category])[0]
-        input_features = [[forecast, shrinkage_rate, unit_price, category_encoded]]
-        prediction = placement_model.predict(input_features)[0]
-        confidence = placement_model.predict_proba(input_features).max()
+        prediction = placement_model.predict([[forecast, shrinkage_rate, unit_price, category_encoded]])[0]
+        confidence = placement_model.predict_proba([[forecast, shrinkage_rate, unit_price, category_encoded]]).max()
         shelf_map = {
             "High": "Front Aisle",
             "Medium": "Mid Aisle",
@@ -148,25 +162,9 @@ def profitability():
         forecasted_sales = float(data['ForecastedSales'])
         unit_price = float(data['UnitPrice'])
         reorder_qty = float(data.get('ReorderQuantity', 1)) or 1
-
-        # Forecasted Revenue
         revenue = forecasted_sales * unit_price
-
-        # Scaled score from 1 to 10
-        if revenue > 10000:
-            score = 10
-        elif revenue > 5000:
-            score = 8
-        elif revenue > 1000:
-            score = 6
-        elif revenue > 500:
-            score = 4
-        else:
-            score = 2
-
-        # ROI = Revenue per reordered unit
+        score = 10 if revenue > 10000 else 8 if revenue > 5000 else 6 if revenue > 1000 else 4 if revenue > 500 else 2
         roi = revenue / reorder_qty
-
         return jsonify({
             "ForecastedRevenue": round(revenue, 2),
             "ProfitabilityScore": score,
