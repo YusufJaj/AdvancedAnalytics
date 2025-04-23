@@ -194,7 +194,7 @@ def pricing():
         suggested_price = (expected_revenue - pricing_model.intercept_ - forecasted_sales * pricing_model.coef_[0]) / pricing_model.coef_[1]
         suggested_price = max(suggested_price, 1.0)
 
-        revenue_gain = (suggested_price - unit_price) * forecasted_sales
+        revenue_gain = (suggested_price - current_price) * forecasted_sales
         direction = "Increase" if suggested_price > current_price else "Reduce" if suggested_price < current_price else "Maintain"
 
         return jsonify({
