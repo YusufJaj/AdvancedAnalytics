@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import GradientBoostingRegressor
 from google.oauth2.service_account import Credentials
 import pandas as pd
 import gspread
@@ -27,11 +28,12 @@ app = Flask(__name__)
 sales_model = None
 shrink_model = None
 placement_model = None
+pricing_model = None
 label_encoder = None
 df = None
 
 def retrain_models():
-    global df, sales_model, shrink_model, placement_model, label_encoder
+    global df, sales_model, shrink_model, placement_model, pricing_model, label_encoder
 
     logging.info("Retraining models...")
 
@@ -42,14 +44,17 @@ def retrain_models():
     df['SalesVelocity'] = pd.to_numeric(df['SalesLast30Days'], errors='coerce').fillna(0) / 30
     df['ShrinkageRate'] = pd.to_numeric(df['ShrinkageLast30Days'], errors='coerce').fillna(0) / 30
 
+    # Sales model
     X_sales = df[['SalesVelocity', 'StockLevel']]
     y_sales = pd.to_numeric(df['SalesLast30Days'], errors='coerce').fillna(0) * 1.2
     sales_model = LinearRegression().fit(X_sales, y_sales)
 
+    # Shrinkage model
     X_shrink = df[['StockLevel', 'SalesLast30Days']].apply(pd.to_numeric, errors='coerce').fillna(0)
     y_shrink = pd.to_numeric(df['ShrinkageLast30Days'], errors='coerce').fillna(0)
     shrink_model = LinearRegression().fit(X_shrink, y_shrink)
 
+    # Shelf placement model
     df['ForecastedSales'] = pd.to_numeric(df['ForecastedSales'], errors='coerce').fillna(0)
     df['UnitPrice'] = pd.to_numeric(df['UnitPrice'], errors='coerce').fillna(0)
     df['PlacementScore'] = df['ForecastedSales'] * df['UnitPrice']
@@ -62,6 +67,13 @@ def retrain_models():
     y_place = df['PlacementPriority'].astype(str)
     placement_model = RandomForestClassifier(n_estimators=100, random_state=42)
     placement_model.fit(X_place, y_place)
+
+    # Auto-pricing model
+    df['StockLevel'] = pd.to_numeric(df['StockLevel'], errors='coerce').fillna(0)
+    df['ReorderPoint'] = pd.to_numeric(df['ReorderPoint'], errors='coerce').fillna(0)
+    X_price = df[['ForecastedSales', 'ShrinkageRate', 'StockLevel', 'ReorderPoint', 'UnitPrice', 'CategoryEncoded']].fillna(0)
+    y_price = df['UnitPrice'] * 1.10  # Simulated target for now
+    pricing_model = GradientBoostingRegressor().fit(X_price, y_price)
 
     logging.info("Retraining complete.")
 
@@ -136,7 +148,7 @@ def placement():
         forecast = data['ForecastedSales']
         shrinkage_rate = data['ShrinkageRate']
         unit_price = data['UnitPrice']
-        category = data.get('Category', 'General')
+        category = data.get('Category', 'Staples')
         if category not in label_encoder.classes_:
             category = 'Staples'
         category_encoded = label_encoder.transform([category])[0]
@@ -155,20 +167,25 @@ def placement():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/profitability', methods=['POST'])
-def profitability():
+@app.route('/pricing', methods=['POST'])
+def pricing():
     try:
         data = request.json
-        forecasted_sales = float(data['ForecastedSales'])
-        unit_price = float(data['UnitPrice'])
-        reorder_qty = float(data.get('ReorderQuantity', 1)) or 1
-        revenue = forecasted_sales * unit_price
-        score = 10 if revenue > 10000 else 8 if revenue > 5000 else 6 if revenue > 1000 else 4 if revenue > 500 else 2
-        roi = revenue / reorder_qty
+        forecast = data['ForecastedSales']
+        shrinkage_rate = data['ShrinkageRate']
+        stock_level = data['StockLevel']
+        reorder_point = data['ReorderPoint']
+        unit_price = data['UnitPrice']
+        category = data.get('Category', 'Staples')
+        if category not in label_encoder.classes_:
+            category = 'Staples'
+        category_encoded = label_encoder.transform([category])[0]
+
+        input_features = [[forecast, shrinkage_rate, stock_level, reorder_point, unit_price, category_encoded]]
+        new_price = pricing_model.predict(input_features)[0]
+
         return jsonify({
-            "ForecastedRevenue": round(revenue, 2),
-            "ProfitabilityScore": score,
-            "RestockROI": round(roi, 2)
+            "SuggestedPrice": round(new_price, 2)
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
