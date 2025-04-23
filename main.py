@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
 from google.oauth2.service_account import Credentials
 import pandas as pd
@@ -27,12 +27,12 @@ app = Flask(__name__)
 sales_model = None
 shrink_model = None
 placement_model = None
-pricing_model = None
+price_model = None
 label_encoder = None
 df = None
 
 def retrain_models():
-    global df, sales_model, shrink_model, placement_model, pricing_model, label_encoder
+    global df, sales_model, shrink_model, placement_model, price_model, label_encoder
 
     logging.info("Retraining models...")
 
@@ -43,7 +43,6 @@ def retrain_models():
     df['SalesVelocity'] = pd.to_numeric(df['SalesLast30Days'], errors='coerce').fillna(0) / 30
     df['ShrinkageRate'] = pd.to_numeric(df['ShrinkageLast30Days'], errors='coerce').fillna(0) / 30
 
-    # Forecasting
     X_sales = df[['SalesVelocity', 'StockLevel']]
     y_sales = pd.to_numeric(df['SalesLast30Days'], errors='coerce').fillna(0) * 1.2
     sales_model = LinearRegression().fit(X_sales, y_sales)
@@ -52,7 +51,6 @@ def retrain_models():
     y_shrink = pd.to_numeric(df['ShrinkageLast30Days'], errors='coerce').fillna(0)
     shrink_model = LinearRegression().fit(X_shrink, y_shrink)
 
-    # Shelf Placement
     df['ForecastedSales'] = pd.to_numeric(df['ForecastedSales'], errors='coerce').fillna(0)
     df['UnitPrice'] = pd.to_numeric(df['UnitPrice'], errors='coerce').fillna(0)
     df['PlacementScore'] = df['ForecastedSales'] * df['UnitPrice']
@@ -66,12 +64,11 @@ def retrain_models():
     placement_model = RandomForestClassifier(n_estimators=100, random_state=42)
     placement_model.fit(X_place, y_place)
 
-    # Auto-Pricing
-    pricing_df = df[(df['ForecastedSales'] > 0) & (df['UnitPrice'] > 0)].copy()
-    pricing_df['EstimatedRevenue'] = pricing_df['ForecastedSales'] * pricing_df['UnitPrice']
-    X_price = pricing_df[['ForecastedSales', 'UnitPrice']]
-    y_price = pricing_df['EstimatedRevenue']
-    pricing_model = LinearRegression().fit(X_price, y_price)
+    # Train Auto-Pricing Assistant model
+    price_training_data = df[['ForecastedSales', 'UnitPrice']].copy()
+    price_training_data['OptimalPrice'] = df['UnitPrice'] * (1 + 0.05 * (df['ForecastedSales'] / df['ForecastedSales'].max()))
+    price_model = RandomForestRegressor(n_estimators=100, random_state=42)
+    price_model.fit(price_training_data[['ForecastedSales', 'UnitPrice']], price_training_data['OptimalPrice'])
 
     logging.info("Retraining complete.")
 
@@ -188,20 +185,16 @@ def pricing():
     try:
         data = request.json
         forecasted_sales = float(data['ForecastedSales'])
-        current_price = float(data['UnitPrice'])
+        unit_price = float(data['UnitPrice'])
 
-        expected_revenue = pricing_model.predict([[forecasted_sales, current_price]])[0]
-        suggested_price = (expected_revenue - pricing_model.intercept_ - forecasted_sales * pricing_model.coef_[0]) / pricing_model.coef_[1]
-        suggested_price = max(suggested_price, 1.0)
-
-        revenue_gain = round((suggested_price - current_price) * forecasted_sales,2)
-        direction = "Increase" if suggested_price > current_price else "Reduce" if suggested_price < current_price else "Maintain"
+        suggested_price = price_model.predict([[forecasted_sales, unit_price]])[0]
+        revenue_gain = round((suggested_price - unit_price) * forecasted_sales, 2)
+        advice = "Increase" if suggested_price > unit_price else "Decrease" if suggested_price < unit_price else "Maintain"
 
         return jsonify({
             "SuggestedPrice": round(suggested_price, 2),
             "RevenueGainPotential": revenue_gain,
-            "PriceChangeAdvice": direction
+            "PriceChangeAdvice": advice
         })
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
